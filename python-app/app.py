@@ -4,180 +4,229 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras.applications.vgg16 import preprocess_input
 from tensorflow.keras.utils import img_to_array
-from mtcnn import MTCNN
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import udf
 from pyspark.sql.types import StructType, StructField, BinaryType, StringType
 import cv2
-import torch
 import json
 import pandas as pd
 import ast
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import faiss
 
-
-# Initialize Spark session
+# Initialize Spark session with optimized settings
 spark = SparkSession.builder \
     .appName("KafkaSparkIntegration") \
     .config("spark.executor.memory", "4g") \
     .config("spark.executor.cores", "2") \
     .config("spark.driver.memory", "4g") \
     .config("spark.driver.cores", "2") \
+    .config("spark.sql.shuffle.partitions", "8") \
+    .config("spark.default.parallelism", "8") \
+    .config("spark.streaming.kafka.consumer.cache.enabled", "true") \
+    .config("spark.streaming.kafka.maxRatePerPartition", "100") \
+    .config("spark.streaming.backpressure.enabled", "true") \
+    .config("spark.streaming.kafka.consumer.poll.ms", "512") \
+    .config("spark.memory.offHeap.enabled", "true") \
+    .config("spark.memory.offHeap.size", "2g") \
     .getOrCreate()
+
+# Initialize face cascade
+face_cascade = None
+def get_face_cascade():
+    global face_cascade
+    if face_cascade is None:
+        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        if not os.path.exists(cascade_path):
+            raise FileNotFoundError(f"Haar cascade file not found at {cascade_path}")
+        face_cascade = cv2.CascadeClassifier(cascade_path)
+    return face_cascade
 
 # Path to the TensorFlow Lite model file
 tflite_model_path = '/app/models/latent_model.tflite'
+
 # Load and broadcast TensorFlow Lite model
 def load_tflite_model(model_path):
     if not os.path.exists(model_path):
         raise FileNotFoundError("Model file not found")
-
     with open(model_path, 'rb') as f:
         tflite_model = f.read()
-
     return tflite_model
-
-
-
-# Load and broadcast MTCNN detector
-def get_mtcnn():
-    return MTCNN()
-
-# bc_mtcnn = spark.sparkContext.broadcast(get_mtcnn())
 
 # Preprocess image for prediction
 def preprocess_image(image_bytes):
-    """Preprocess an image and perform face detection using a lazily initialized MTCNN."""
-    np_arr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-    if img is None:
+    """Preprocess an image and perform face detection using Haar Cascade."""
+    try:
+        # Convert bytes to numpy array
+        np_arr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+
+        # Convert to grayscale for Haar Cascade
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Get face cascade classifier
+        cascade = get_face_cascade()
+        
+        # Detect faces
+        faces = cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(30, 30)
+        )
+        
+        if len(faces) == 0:
+            return None
+            
+        # Get the largest face if multiple faces are detected
+        if len(faces) > 1:
+            faces = sorted(faces, key=lambda x: x[2] * x[3], reverse=True)
+        
+        x, y, w, h = faces[0]
+        face_img = img[y:y+h, x:x+w]
+        
+        # Resize and preprocess for the model
+        face_img = cv2.resize(face_img, (224, 224))
+        face_img = img_to_array(face_img)
+        face_img = np.expand_dims(face_img, axis=0)
+        face_img = preprocess_input(face_img)
+        
+        return np.ascontiguousarray(face_img)
+        
+    except Exception as e:
+        print(f"Error in preprocess_image: {str(e)}")
         return None
 
-    # Initialize MTCNN detector lazily
-    detector = MTCNN()  # MTCNN is reinitialized on each executor
-    results = detector.detect_faces(img)
-    if not results:
-        return None
-
-    y, x, width, height = results[0]['box']
-    img_t = img[y:y + height, x:x + width]
-    img_t = cv2.resize(img_t, (224, 224))
-    img_t = img_to_array(img_t)
-    img_t = np.expand_dims(img_t, axis=0)
-    img_t = preprocess_input(img_t)
-
-    return np.ascontiguousarray(img_t)
-
-# def threshold_predictions(predictions, threshold=0.5):
-#     binary_predictions = np.array(predictions >= threshold, dtype=np.float32)
-#     return binary_predictions
-
-# Perform batch predictions with TensorFlow Lite
-
+# Load TFLite model content
 bc_model = load_tflite_model(tflite_model_path)
-def predict_batch(images):
-    interpreter = tf.lite.Interpreter(model_content=bc_model)
-    interpreter.allocate_tensors()
-    input_details = interpreter.get_input_details()[0]
-    output_details = interpreter.get_output_details()[0]
 
-    predictions = []
-    for img in images:
-        interpreter.set_tensor(input_details['index'], img)
-        interpreter.invoke()
-        predictions.append(interpreter.get_tensor(output_details['index'])[0])
-
-
-    return predictions
-
-
+def predict_single(image, interpreter, input_details, output_details):
+    """Generate embedding for a single image using TFLite model."""
+    interpreter.set_tensor(input_details['index'], image)
+    interpreter.invoke()
+    return interpreter.get_tensor(output_details['index'])[0]
 
 def cosine_similarity(a, b):
     """Compute cosine similarity between two tensors."""
-    return F.cosine_similarity(a, b, dim=-1)
-
+    return -tf.keras.losses.cosine_similarity(a, b, axis=-1)
 
 def safe_eval(value):
+    """Safely evaluate string representation of embeddings."""
     try:
         return ast.literal_eval(value)
     except (ValueError, SyntaxError):
         print(f"Skipping malformed embedding: {value}")
         return None  # Or provide a default embedding, e.g., [0.0] * 64
 
+df_csv = pd.read_csv('/app/embeddings/person_embeddings_combined.csv')
 
-
-def find_nearest_neighbor(prediction,df_csv):
-    model_embeddings = torch.tensor(np.array(prediction), dtype=torch.float32).unsqueeze(0)  # Shape: (1, 15, 64)
-    similarity = 0
-    matching_row_id = -1
-    for idx, row in df_csv.iterrows():
-        row_embeddings = torch.tensor(np.array(row['embedding']), dtype=torch.float32).unsqueeze(0) 
-        s = cosine_similarity(row_embeddings, model_embeddings) 
-        #print(s , similarity)
-        if s.item() > similarity:
-            similarity = s.item()
-            matching_row_id = idx
+# Convert the 'embedding' column from strings to NumPy arrays
+df_csv['embedding'] = df_csv['embedding'].apply(safe_eval)
     
+# Convert the list of embeddings to a NumPy array
+embeddings = np.array(df_csv['embedding'].tolist(), dtype=np.float32)
+
+# Normalize the embeddings (optional but recommended for cosine similarity)
+embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+# Load embeddings from CSV
+    
+# Build FAISS index
+dimension = embeddings.shape[1]
+
+# Create a FAISS index for inner product (cosine similarity)
+index = faiss.IndexFlatIP(dimension)
+
+# Add the embeddings to the index
+index.add(embeddings)
+
+def find_nearest_neighbor(prediction, index, df_csv, k=1):
+    """
+    Find the nearest neighbor using FAISS.
+
+    Args:
+        prediction (np.array): The query vector (model's output).
+        index (faiss.Index): The FAISS index.
+        df_csv (pd.DataFrame): The CSV data with person information.
+        k (int): Number of nearest neighbors to retrieve.
+
+    Returns:
+        dict: Information about the nearest neighbor.
+    """
+    # Normalize the query vector
+    prediction = prediction / np.linalg.norm(prediction)
+
+    # Reshape the query vector to match FAISS input format
+    prediction = np.array([prediction], dtype=np.float32)
+
+    # Perform the search
+    distances, indices = index.search(prediction, k)
+
+    # Retrieve the nearest neighbor's information
+    matching_row_id = indices[0][0]
+    similarity = float(distances[0][0])  # Convert float32 to native float
+
     if matching_row_id + 1 < 10:
-        imageURL = f"/home/zakaria/Downloads/GTdb_crop2/P{matching_row_id + 1}/s0{matching_row_id + 1}_01.jpg"
+        imageURL = f"/s0{matching_row_id + 1}/01.jpg"
     else:
-        imageURL = f"/home/zakaria/Downloads/GTdb_crop2/P{matching_row_id + 1}/s{matching_row_id + 1}_01.jpg"
+        imageURL = f"/s{matching_row_id + 1}/01.jpg"
 
+    # Get person information from the CSV
     data = {
-        's' : similarity,
-        'name' : df_csv.iloc[matching_row_id]['name'] ,
-        'person_id' : matching_row_id + 1,
-        'age' : df_csv.iloc[matching_row_id]['age'].item() ,
-        'nationality' : df_csv.iloc[matching_row_id]['nationality'] ,
-        'job' : df_csv.iloc[matching_row_id]['job'],
-        'imageURL' : imageURL
-
+        's': similarity,
+        'name': df_csv.iloc[matching_row_id]['name'],
+        'person_id': int(matching_row_id + 1),  # Convert to native int
+        'age': int(df_csv.iloc[matching_row_id]['age']),  # Convert to native int
+        'nationality': df_csv.iloc[matching_row_id]['nationality'],
+        'job': df_csv.iloc[matching_row_id]['job'],
+        'imageURL': imageURL
     }
+
     return data, similarity
 
 df_csv = pd.read_csv('/app/embeddings/person_embeddings_combined.csv')
 df_csv['embedding'] = df_csv['embedding'].apply(safe_eval)  
-# UDF for prediction
+
 def predict_udf(image_bytes):
     try:
+        # Initialize TFLite interpreter for this worker
+        interpreter = tf.lite.Interpreter(model_content=bc_model)
+        interpreter.allocate_tensors()
+        input_details = interpreter.get_input_details()[0]
+        output_details = interpreter.get_output_details()[0]
+
         img = preprocess_image(image_bytes)
         if img is None:
             return json.dumps({'status': 'error', 'message': 'No face detected'})
 
-        prediction = predict_batch([img])[0]
-        # nearest_neighbor, distance = find_nearest_neighbor(prediction)
+        prediction = predict_single(img, interpreter, input_details, output_details)
         
-        
-        data, similarity = find_nearest_neighbor(prediction, df_csv)
-        # if nearest_neighbor and distance < 15:  # Check if distance is less than 15
-        if data and similarity > 0.5:  # Check if distance is less than 15
+        data, similarity = find_nearest_neighbor(prediction, index, df_csv)
+        if data and similarity > 0.5: 
             return json.dumps({
                 'status': 'success',                                                                                            
                 'data': {
-                    'similarity': data.get('s', 'N/A'),
-                    'ID': data.get('person_id', 'N/A'),
-                    'name': data.get('name', 'N/A'),
-                    'age': data.get('age', 'N/A'),
-                    'nationality': data.get('nationality', 'N/A'),
-                    'job': data.get('job', 'N/A'),
-                    'imageURL' : data.get('imageURL', 'N/A'),
+                    'ID': data['person_id'],
+                    'name': data['name'],
+                    'age': data['age'],
+                    'nationality': data['nationality'],
+                    'job': data['job'],
+                    'similarity': f"{similarity:.2%}",
+                    'imageURL': data['imageURL']
                 }
-               
             })
-        else:  # If no match or distance >= 15
+        else:  
             return json.dumps({
                 'status': 'error',
                 'message': 'The person does not exist in the dataset or is not a close match'
             })
     except Exception as e:
-        return json.dumps({'status': 'error', 'message': str(e)})
+        return json.dumps({
+            'status': 'error',
+            'message': str(e)
+        })
 
 predict_udf = udf(predict_udf, StringType())
-
-
-
 
 # Kafka schema
 schema = StructType([
@@ -205,8 +254,3 @@ query = predictions_df \
     .start()
 
 spark.streams.awaitAnyTermination()
-
-
-
-
-
